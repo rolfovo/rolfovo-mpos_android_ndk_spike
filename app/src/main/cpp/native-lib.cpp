@@ -1,6 +1,7 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -12,7 +13,10 @@
 
 extern "C" {
 #include "lvgl.h"
+#include "port/micropython_embed.h"
 }
+
+#include "mpos_bridge.h"
 
 #define LOG_TAG "MPOSAndroidSpike"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -28,11 +32,16 @@ uint32_t g_draw_buf_size = 0;
 int32_t g_width = 0;
 int32_t g_height = 0;
 bool g_lvgl_started = false;
+bool g_micropython_started = false;
 bool g_paused = false;
 bool g_touch_pressed = false;
 int32_t g_touch_x = 0;
 int32_t g_touch_y = 0;
 uint32_t g_click_count = 0;
+alignas(std::max_align_t) uint8_t g_micropython_heap[256 * 1024];
+lv_obj_t *g_title_label = nullptr;
+lv_obj_t *g_subtitle_label = nullptr;
+lv_obj_t *g_status_label = nullptr;
 lv_obj_t *g_count_label = nullptr;
 lv_obj_t *g_touch_label = nullptr;
 
@@ -58,10 +67,41 @@ void update_touch_label() {
     }
 }
 
+void execute_python(const char *script) {
+    if (g_micropython_started) {
+        mp_embed_exec_str(script);
+    }
+}
+
+void start_micropython() {
+    if (g_micropython_started) {
+        return;
+    }
+
+    int stack_top = 0;
+    mp_embed_init(g_micropython_heap, sizeof(g_micropython_heap), &stack_top);
+    g_micropython_started = true;
+    execute_python(
+        "import mpos\n"
+        "mpos.set_title('MicroPythonOS Android NDK spike')\n"
+        "mpos.set_subtitle('LVGL UI text set by embedded MicroPython')\n"
+        "mpos.set_status('MicroPython runtime initialized')\n");
+}
+
+void stop_micropython() {
+    if (g_micropython_started) {
+        mp_embed_deinit();
+        g_micropython_started = false;
+    }
+}
+
 void button_event_cb(lv_event_t *event) {
     if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
         g_click_count++;
         update_count_label();
+        execute_python(
+            "import mpos\n"
+            "mpos.set_status('MicroPython saw click ' + str(mpos.clicks()))\n");
     }
 }
 
@@ -135,18 +175,18 @@ void create_demo_screen() {
     lv_obj_t *screen = lv_screen_active();
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x101820), 0);
 
-    lv_obj_t *title = lv_label_create(screen);
-    lv_label_set_text(title, "MicroPythonOS Android NDK spike");
-    lv_obj_set_style_text_color(title, lv_color_hex(0xf7f7f7), 0);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 24);
+    g_title_label = lv_label_create(screen);
+    lv_label_set_text(g_title_label, "MicroPythonOS Android NDK spike");
+    lv_obj_set_style_text_color(g_title_label, lv_color_hex(0xf7f7f7), 0);
+    lv_obj_set_style_text_font(g_title_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(g_title_label, LV_ALIGN_TOP_MID, 0, 24);
 
-    lv_obj_t *subtitle = lv_label_create(screen);
-    lv_label_set_text(subtitle, "LVGL from MicroPythonOS submodule, rendered through ANativeWindow");
-    lv_obj_set_style_text_color(subtitle, lv_color_hex(0x9fb3c8), 0);
-    lv_obj_set_width(subtitle, LV_PCT(90));
-    lv_obj_set_style_text_align(subtitle, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align_to(subtitle, title, LV_ALIGN_OUT_BOTTOM_MID, 0, 12);
+    g_subtitle_label = lv_label_create(screen);
+    lv_label_set_text(g_subtitle_label, "LVGL from MicroPythonOS submodule, rendered through ANativeWindow");
+    lv_obj_set_style_text_color(g_subtitle_label, lv_color_hex(0x9fb3c8), 0);
+    lv_obj_set_width(g_subtitle_label, LV_PCT(90));
+    lv_obj_set_style_text_align(g_subtitle_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align_to(g_subtitle_label, g_title_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 12);
 
     lv_obj_t *button = lv_button_create(screen);
     lv_obj_set_size(button, 260, 72);
@@ -161,6 +201,11 @@ void create_demo_screen() {
     lv_obj_set_style_text_color(g_count_label, lv_color_hex(0xf7f7f7), 0);
     update_count_label();
     lv_obj_align_to(g_count_label, button, LV_ALIGN_OUT_BOTTOM_MID, 0, 16);
+
+    g_status_label = lv_label_create(screen);
+    lv_label_set_text(g_status_label, "MicroPython runtime not started yet");
+    lv_obj_set_style_text_color(g_status_label, lv_color_hex(0xffd166), 0);
+    lv_obj_align_to(g_status_label, g_count_label, LV_ALIGN_OUT_BOTTOM_MID, 0, 12);
 
     lv_obj_t *slider = lv_slider_create(screen);
     lv_obj_set_width(slider, LV_PCT(78));
@@ -199,6 +244,7 @@ void ensure_lvgl(int32_t width, int32_t height) {
         lv_indev_set_read_cb(g_pointer, pointer_read_cb);
 
         create_demo_screen();
+        start_micropython();
     } else if (width != g_width || height != g_height) {
         if (!allocate_draw_buffer(width, height)) {
             return;
@@ -235,6 +281,31 @@ void set_window(ANativeWindow *window, int32_t width, int32_t height) {
 }
 
 } // namespace
+
+extern "C" void mpos_bridge_set_title(const char *text) {
+    if (g_title_label != nullptr) {
+        lv_label_set_text(g_title_label, text != nullptr ? text : "");
+        lv_obj_invalidate(g_title_label);
+    }
+}
+
+extern "C" void mpos_bridge_set_subtitle(const char *text) {
+    if (g_subtitle_label != nullptr) {
+        lv_label_set_text(g_subtitle_label, text != nullptr ? text : "");
+        lv_obj_invalidate(g_subtitle_label);
+    }
+}
+
+extern "C" void mpos_bridge_set_status(const char *text) {
+    if (g_status_label != nullptr) {
+        lv_label_set_text(g_status_label, text != nullptr ? text : "");
+        lv_obj_invalidate(g_status_label);
+    }
+}
+
+extern "C" uint32_t mpos_bridge_click_count(void) {
+    return g_click_count;
+}
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_example_mposandroid_MainActivity_nativeSurfaceCreated(JNIEnv *env, jclass, jobject surface) {
@@ -301,11 +372,15 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_example_mposandroid_MainActivity_nativeShutdown(JNIEnv *, jclass) {
     std::lock_guard<std::mutex> guard(g_lock);
     set_window(nullptr, 0, 0);
+    stop_micropython();
     std::free(g_draw_buf);
     g_draw_buf = nullptr;
     g_draw_buf_size = 0;
     g_display = nullptr;
     g_pointer = nullptr;
+    g_title_label = nullptr;
+    g_subtitle_label = nullptr;
+    g_status_label = nullptr;
     g_count_label = nullptr;
     g_touch_label = nullptr;
     if (g_lvgl_started) {
